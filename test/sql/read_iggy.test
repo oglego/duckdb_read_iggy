@@ -1,0 +1,20 @@
+# name: test/sql/read_iggy.test
+# description: test read_iggy extension
+# group: [read_iggy]
+
+# Before we load the extension, this will fail
+statement error
+SELECT read_iggy('Sam');
+----
+Catalog Error: Scalar Function with name read_iggy does not exist!
+
+# Require statement will ensure the extension is loaded from now on
+require read_iggy
+
+require icu
+
+# Confirm the extension works
+query I
+SELECT * from read_iggy('Sam');
+----
+Rusty Quack Sam 🐥
