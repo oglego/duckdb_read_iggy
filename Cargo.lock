@@ -2794,6 +2794,7 @@ dependencies = [
 name = "read_iggy"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "duckdb",
  "iggy",
  "once_cell",

@@ -174,50 +174,39 @@ impl VTab for IggyVTab {
             return Ok(());
         }
 
-        let messages = RUNTIME.block_on(async {
+        let json_result = RUNTIME.block_on(async {
+
             let current_offset = *init_data.current_offset.read().unwrap();
             
-            // Build HTTP REST API URL for polling messages
-            // The endpoint is /streams/{stream_id}/topics/{topic_id}/messages
-            // Partition is specified as a query parameter
             let url = format!(
                 "{}/streams/{}/topics/{}/messages?offset={}&count=1024&partition={}",
                 init_data.http_url, init_data.stream_id, init_data.topic_id, current_offset, init_data.partition_id
             );
-            
-            println!("Fetching from: {}", url);
             
             let response = init_data.http_client.get(&url)
                 .header("Authorization", format!("Bearer {}", init_data.jwt_token))
                 .send()
                 .await?;
             
-            let status = response.status();
-            println!("Response status: {}", status);
-            
             let body_text = response.text().await?;
-            println!("Response body: {}", body_text);
             
-            // Try to parse as JSON, or return empty if body is empty
-            let json = if body_text.is_empty() {
-                println!("Empty response body, returning empty messages");
+            let json: serde_json::Value = if body_text.is_empty() {
                 serde_json::json!({"messages": []})
             } else {
                 serde_json::from_str(&body_text)?
             };
             
-            println!("Parsed JSON: {:?}", json);
-            Ok::<Value, Box<dyn Error>>(json)
+            Ok::<serde_json::Value, Box<dyn Error>>(json)
         })?;
 
-        // Parse messages from the JSON response
         let empty_vec = vec![];
-        let messages_array = messages.get("messages")
+        let messages_array = json_result.get("messages")
             .and_then(|m| m.as_array())
             .unwrap_or(&empty_vec);
 
         if messages_array.is_empty() {
-            *init_data.finished.write().unwrap() = true;
+            let mut finished_guard = init_data.finished.write().unwrap();
+            *finished_guard = true;
             output.set_len(0);
             return Ok(());
         }
@@ -226,19 +215,42 @@ impl VTab for IggyVTab {
         let payload_vec = output.flat_vector(1);
 
         let count = messages_array.len();
+        let mut last_processed_offset = 0;
+        let start_offset = *init_data.current_offset.read().unwrap();
+
         for (i, msg) in messages_array.iter().enumerate() {
-            if let Some(offset) = msg.get("offset").and_then(|v| v.as_u64()) {
-                unsafe {
-                    let offset_data = offset_vec.as_mut_ptr() as *mut i64;
-                    *offset_data.add(i) = offset as i64;
-                }
-                
-                if let Some(payload) = msg.get("payload").and_then(|v| v.as_str()) {
-                    payload_vec.insert(i, payload.as_bytes());
-                }
-                
-                *init_data.current_offset.write().unwrap() = offset + 1;
+            let offset = msg.get("header")
+                .and_then(|h| h.get("offset"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+
+            if i == 0 && offset < start_offset && start_offset != 0 {
+                output.set_len(0);
+                return Ok(());
             }
+
+            unsafe {
+                let offset_ptr = offset_vec.as_mut_ptr() as *mut i64;
+                *offset_ptr.add(i) = offset as i64;
+            }
+
+            if let Some(payload_base64) = msg.get("payload").and_then(|v| v.as_str()) {
+                use base64::{Engine as _, engine::general_purpose};
+       
+                let decoded_bytes = general_purpose::STANDARD
+                    .decode(payload_base64)
+                    .unwrap_or_else(|_| payload_base64.as_bytes().to_vec());
+
+                payload_vec.insert(i, &decoded_bytes);
+            }
+            
+            last_processed_offset = offset;
+        }
+
+        {
+            let mut offset_guard = init_data.current_offset.write().unwrap();
+            *offset_guard = last_processed_offset + 1;
+            println!("Cursor updated: Fetching next from offset {}", *offset_guard);
         }
 
         output.set_len(count);
