@@ -1,116 +1,241 @@
-# DuckDB Rust extension template
-This is an **experimental** template for Rust based extensions based on the C Extension API of DuckDB. The goal is to
-turn this eventually into a stable basis for pure-Rust DuckDB extensions that can be submitted to the Community extensions
-repository
+# DuckDB Iggy Extension
 
-Features:
-- No DuckDB build required
-- No C++ or C code required
-- CI/CD chain preconfigured
-- (Coming soon) Works with community extensions
+A high-performance DuckDB extension for reading message streams directly from [Iggy](https://iggy.rs/), a blazing-fast distributed message streaming platform.
 
-## Cloning
+> **⚠️ EXPERIMENTAL**: This extension is in early-stage development for Iggy v0.7.0. Use in development environments only.
 
-Clone the repo with submodules
+## Features
 
-```shell
-git clone --recurse-submodules <repo>
+- Read message streams from Iggy directly in SQL queries
+- HTTP-based API (version-agnostic, no binary protocol issues)
+- JWT authentication support
+- Partition-based message consumption
+- Full DuckDB integration
+
+---
+
+## Quick Start
+
+### 1. Docker Setup (macOS / Apple Silicon)
+
+Iggy v0.7.0 on macOS requires specific Docker flags to bypass `io_uring` and core-binding restrictions:
+
+```bash
+docker run -d --name iggy-test \
+  --security-opt seccomp=unconfined \
+  -e IGGY_IO_URING_ENABLED=false \
+  -e IGGY_HTTP_ADDRESS=0.0.0.0:3000 \
+  -e IGGY_TCP_ADDRESS=0.0.0.0:8090 \
+  -e IGGY_ROOT_USERNAME=iggy \
+  -e IGGY_ROOT_PASSWORD=iggy \
+  -p 3000:3000/tcp \
+  -p 8090:8090/tcp \
+  apache/iggy:0.7.0
 ```
 
-## Dependencies
-In principle, these extensions can be compiled with the Rust toolchain alone. However, this template relies on some additional
-tooling to make life a little easier and to be able to share CI/CD infrastructure with extension templates for other languages:
+### 2. Initialize Streams and Topics
 
-- Python3
-- Python3-venv
-- [Make](https://www.gnu.org/software/make)
-- Git
+First, authenticate to get a JWT token:
 
-Installing these dependencies will vary per platform:
-- For Linux, these come generally pre-installed or are available through the distro-specific package manager.
-- For MacOS, [homebrew](https://formulae.brew.sh/).
-- For Windows, [chocolatey](https://community.chocolatey.org/).
-
-## Building
-After installing the dependencies, building is a two-step process. Firstly run:
-```shell
-make configure
-```
-This will ensure a Python venv is set up with DuckDB and DuckDB's test runner installed. Additionally, depending on configuration,
-DuckDB will be used to determine the correct platform for which you are compiling.
-
-Then, to build the extension run:
-```shell
-make debug
-```
-This delegates the build process to cargo, which will produce a shared library in `target/debug/<shared_lib_name>`. After this step,
-a script is run to transform the shared library into a loadable extension by appending a binary footer. The resulting extension is written
-to the `build/debug` directory.
-
-To create optimized release binaries, simply run `make release` instead.
-
-### Running the extension
-To run the extension code, start `duckdb` with `-unsigned` flag. This will allow you to load the local extension file.
-
-```sh
-duckdb -unsigned
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/users/login \
+  -H "Content-Type: application/json" \
+  -d '{"username": "iggy", "password": "iggy"}' \
+  | jq -r '.access_token.token')
 ```
 
-After loading the extension by the file path, you can use the functions provided by the extension (in this case, `rusty_quack()`).
+Create a stream:
+
+```bash
+curl -X POST http://localhost:3000/streams \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"stream_id": 1, "name": "stream1"}'
+```
+
+**Note**: The response will show `"id":0` - this is the auto-generated stream ID. Use this ID (0) in subsequent API calls.
+
+Create a topic (all fields are mandatory in v0.7.0):
+
+```bash
+curl -X POST http://localhost:3000/streams/0/topics \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "topic_id": 1,
+    "name": "topic1",
+    "partitions_count": 1,
+    "compression_algorithm": "none",
+    "message_expiry": 0,
+    "max_topic_size": 0,
+    "replication_factor": 1
+  }'
+```
+
+**Note**: Again, the response will show `"id":0` for the topic. Use this in the messages endpoint.
+
+### 3. Publish Test Messages
+
+Messages must include the partition ID as a Base64-encoded 4-byte little-endian integer:
+- Partition 0: `AAAAAA==`
+- Partition 1: `AQAAAA==`
+
+**Important**: Use the auto-generated stream and topic IDs (typically 0 for the first created) from the API responses:
+
+```bash
+curl -X POST http://localhost:3000/streams/0/topics/0/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "partitioning": {
+      "kind": "partition_id",
+      "value": "AAAAAA=="
+    },
+    "messages": [
+      {"payload": "SGVsbG8gMC43LjA="}
+    ]
+  }'
+```
+
+### 4. Build the Extension
+
+```bash
+make debug          # Development build
+# or
+make release        # Optimized build
+```
+
+### 5. Query in DuckDB
+
+Load the extension and query messages:
 
 ```sql
-LOAD './build/debug/extension/rusty_quack/rusty_quack.duckdb_extension';
-SELECT * FROM rusty_quack('Jane');
+LOAD './build/debug/extension/read_iggy/read_iggy.duckdb_extension';
+
+SELECT 
+  "offset", 
+  CAST(payload AS VARCHAR) as message 
+FROM read_iggy('0', '0', 0, 'iggy://iggy:iggy@127.0.0.1:8090') 
+LIMIT 5;
 ```
 
-```
-┌─────────────────────┐
-│       column0       │
-│       varchar       │
-├─────────────────────┤
-│ Rusty Quack Jane 🐥 │
-└─────────────────────┘
-```
+Note: Use the auto-generated IDs (typically 0 for the first stream and topic created).
 
-## Testing
-This extension uses the DuckDB Python client for testing. This should be automatically installed in the `make configure` step.
-The tests themselves are written in the SQLLogicTest format, just like most of DuckDB's tests. A sample test can be found in
-`test/sql/<extension_name>.test`. To run the tests using the *debug* build:
+---
 
-```shell
-make test_debug
+## API Reference
+
+### Connection String Format
+
+```
+iggy://[username:password@]host[:port]
 ```
 
-or for the *release* build:
-```shell
-make test_release
+Examples:
+- `iggy://iggy:iggy@127.0.0.1:8090` - with credentials
+- `iggy://127.0.0.1:8090` - uses default credentials (iggy/iggy)
+- `iggy://127.0.0.1` - uses default port 8090
+
+**Note**: The extension automatically routes HTTP requests to port 3000 (HTTP API), regardless of the port specified in the connection string.
+
+### Function Signature
+
+```sql
+read_iggy(
+  stream_id VARCHAR,      -- Stream name or ID
+  topic_id VARCHAR,       -- Topic name or ID  
+  partition_id INTEGER,   -- Partition number
+  connection STRING       -- Connection string (iggy://)
+)
 ```
 
-### Version switching
-Testing with different DuckDB versions is really simple:
+Returns two columns:
+- `offset` BIGINT - Message offset in the partition
+- `payload` BLOB - Message payload bytes
 
-First, run
+---
+
+## Implementation Details
+
+### HTTP vs Binary Protocol
+
+This extension uses the **HTTP API** (port 3000) rather than the binary protocol (port 8090) to avoid version-specific compatibility issues:
+
+- ✅ Version-agnostic JSON serialization
+- ✅ Standard HTTP semantics
+- ✅ JWT-based authentication
+- ✅ Stable across Iggy releases
+
+### Authentication Flow
+
+1. POST credentials to `/users/login` → receives JWT token
+2. Include token in `Authorization: Bearer {token}` header for all API requests
+3. Response structure: `access_token.token` (nested)
+
+### Message Polling
+
+Messages are fetched via:
 ```
+GET /api/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}/messages
+  ?offset={current_offset}&count=1024
+```
+
+The extension tracks offset internally and automatically fetches the next batch of messages.
+
+---
+
+## Development
+
+### Building
+
+```bash
+make configure      # First time setup
+make debug          # Development build
+make release        # Production build
+```
+
+### Testing
+
+```bash
+make test_debug     # Run tests against debug build
+make test_release   # Run tests against release build
+```
+
+### Changing DuckDB Versions
+
+```bash
 make clean_all
-```
-to ensure the previous `make configure` step is deleted.
-
-Then, run
-```
 DUCKDB_TEST_VERSION=v1.3.2 make configure
-```
-to select a different duckdb version to test with
-
-Finally, build and test with
-```
 make debug
 make test_debug
 ```
 
-### Known issues
-This is a bit of a footgun, but the extensions produced by this template may (or may not) be broken on windows on python3.11
-with the following error on extension load:
-```shell
-IO Error: Extension '<name>.duckdb_extension' could not be loaded: The specified module could not be found
-```
-This was resolved by using python 3.12
+---
+
+## Troubleshooting
+
+### "401 Unauthorized"
+- Verify credentials in connection string
+- Check that Iggy HTTP server is listening on port 3000
+- Ensure stream and topic exist
+
+### "Partition not found"
+- Verify partition ID matches the topic's partition count
+- Use partition ID 0 for topics with 1 partition
+
+### "Invalid command" (binary protocol)
+This extension uses HTTP API, not the binary protocol. If you see binary protocol errors, the extension version may be mismatched with your Iggy server.
+
+---
+
+## License
+
+Experimental / MIT
+
+---
+
+## Related Links
+
+- [DuckDB Documentation](https://duckdb.org/)
+- [Iggy Documentation](https://iggy.rs/docs)
+- [DuckDB Rust Extension Template](https://github.com/duckdb/duckdb-rust-extension-template)
