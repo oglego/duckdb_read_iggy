@@ -136,7 +136,7 @@ Examples:
 - `iggy://127.0.0.1:8090` - uses default credentials (iggy/iggy)
 - `iggy://127.0.0.1` - uses default port 8090
 
-**Note**: The extension automatically routes HTTP requests to port 3000 (HTTP API), regardless of the port specified in the connection string.
+**Note**: The extension uses the HTTP API. If you specify a port in the connection string, that HTTP port is used. If you omit the port, it defaults to `3000`.
 
 ### Function Signature
 
@@ -159,7 +159,7 @@ Returns two columns:
 
 ### HTTP vs Binary Protocol
 
-This extension uses the **HTTP API** (port 3000) rather than the binary protocol (port 8090) to avoid version-specific compatibility issues:
+This extension uses the **HTTP API** rather than the binary protocol (port 8090) to avoid version-specific compatibility issues:
 
 - ✅ Version-agnostic JSON serialization
 - ✅ Standard HTTP semantics
@@ -169,8 +169,9 @@ This extension uses the **HTTP API** (port 3000) rather than the binary protocol
 ### Authentication Flow
 
 1. POST credentials to `/users/login` → receives JWT token
-2. Include token in `Authorization: Bearer {token}` header for all API requests
-3. Response structure: `access_token.token` (nested)
+2. Include token in `Authorization: Bearer {token}` header for API requests
+3. If the token expires and the server returns `401 Unauthorized`, the extension re-authenticates once and retries the request
+4. Response structure: `access_token.token` (nested)
 
 ### Message Polling
 
@@ -180,7 +181,7 @@ GET /api/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}/message
   ?offset={current_offset}&count=1024
 ```
 
-The extension tracks offset internally and automatically fetches the next batch of messages.
+The extension tracks offset internally, validates that returned offsets are contiguous, and only advances to the next batch after the current batch has been validated.
 
 ---
 

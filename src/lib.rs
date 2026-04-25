@@ -5,50 +5,51 @@ use duckdb::{
     Connection, Result,
 };
 use once_cell::sync::Lazy;
+use reqwest::{Client, StatusCode, Url};
+use serde_json::{json, Value};
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 use tokio::runtime::Runtime;
-use serde_json::{json, Value};
-use reqwest::Client;
 
-static RUNTIME: Lazy<Runtime> = Lazy::new(|| Runtime::new().expect("Failed to create Tokio runtime"));
+static RUNTIME: Lazy<Runtime> =
+    Lazy::new(|| Runtime::new().expect("Failed to create Tokio runtime"));
+const DEFAULT_HTTP_PORT: u16 = 3000;
+const REQUEST_TIMEOUT_SECS: u64 = 10;
+const CONNECT_TIMEOUT_SECS: u64 = 3;
 
 /// Parse iggy://[username:password@]host[:port] connection strings into HTTP URL and credentials
-fn parse_iggy_connection_string(conn_str: &str) -> Result<(String, String, String), Box<dyn Error>> {
-    // Remove iggy:// scheme
-    let without_scheme = conn_str
-        .strip_prefix("iggy://")
-        .unwrap_or(conn_str);
-    
-    // Extract credentials and host part
-    let (credentials, host_port) = if let Some(at_pos) = without_scheme.rfind('@') {
-        let creds = &without_scheme[..at_pos];
-        let host = &without_scheme[at_pos + 1..];
-        (Some(creds), host)
+fn parse_iggy_connection_string(
+    conn_str: &str,
+) -> Result<(String, String, String), Box<dyn Error>> {
+    let with_scheme = if conn_str.contains("://") {
+        conn_str.replacen("iggy://", "http://", 1)
     } else {
-        (None, without_scheme)
+        format!("http://{}", conn_str)
     };
-    
-    // Parse username and password
-    let (username, password) = if let Some(creds) = credentials {
-        if let Some(colon_pos) = creds.find(':') {
-            (creds[..colon_pos].to_string(), creds[colon_pos + 1..].to_string())
-        } else {
-            (creds.to_string(), String::new())
-        }
+
+    let url = Url::parse(&with_scheme)?;
+    let username = if url.username().is_empty() {
+        "iggy".to_string()
     } else {
-        ("iggy".to_string(), "iggy".to_string())
+        url.username().to_string()
     };
-    
-    // Parse host (ignore port from connection string, always use 3000 for HTTP)
-    let host = if let Some(colon_pos) = host_port.rfind(':') {
-        host_port[..colon_pos].to_string()
+    let password = url.password().unwrap_or("iggy").to_string();
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| -> Box<dyn Error> { "Missing host in connection string".into() })?
+        .trim_matches(&['[', ']'][..])
+        .to_string();
+    let port = url.port().unwrap_or(DEFAULT_HTTP_PORT);
+
+    let http_url = if host.contains(':') {
+        format!("http://[{host}]:{port}")
     } else {
-        host_port.to_string()
+        format!("http://{host}:{port}")
     };
-    
-    // HTTP API always uses port 3000
-    let http_url = format!("http://{}:3000", host);
+
     Ok((http_url, username, password))
 }
 
@@ -69,6 +70,83 @@ fn parse_messages_response(body: &[u8]) -> Result<Value, Box<dyn Error>> {
     }
 }
 
+async fn authenticate(
+    http_client: &Client,
+    http_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, Box<dyn Error>> {
+    let login_url = format!("{}/users/login", http_url);
+    let login_body = json!({
+        "username": username,
+        "password": password
+    });
+
+    let response = http_client
+        .post(&login_url)
+        .header("Content-Type", "application/json")
+        .json(&login_body)
+        .send()
+        .await?
+        .error_for_status()?;
+
+    let response_json: Value = response.json().await?;
+    extract_access_token(&response_json)
+}
+
+async fn fetch_messages(
+    init_data: &IggyInitData,
+    current_offset: u64,
+) -> Result<Value, Box<dyn Error>> {
+    let url = format!(
+        "{}/streams/{}/topics/{}/messages?offset={}&count=1024&partition={}",
+        init_data.http_url,
+        init_data.stream_id,
+        init_data.topic_id,
+        current_offset,
+        init_data.partition_id
+    );
+
+    let auth_header = {
+        let auth_header = init_data.auth_header.lock().unwrap();
+        auth_header.clone()
+    };
+
+    let mut response = init_data
+        .http_client
+        .get(&url)
+        .header("Authorization", &auth_header)
+        .send()
+        .await?;
+
+    if response.status() == StatusCode::UNAUTHORIZED {
+        let jwt_token = authenticate(
+            &init_data.http_client,
+            &init_data.http_url,
+            &init_data.username,
+            &init_data.password,
+        )
+        .await?;
+
+        let refreshed_auth_header = format!("Bearer {}", jwt_token);
+        {
+            let mut auth_header = init_data.auth_header.lock().unwrap();
+            *auth_header = refreshed_auth_header.clone();
+        }
+
+        response = init_data
+            .http_client
+            .get(&url)
+            .header("Authorization", &refreshed_auth_header)
+            .send()
+            .await?;
+    }
+
+    let response = response.error_for_status()?;
+    let body = response.bytes().await?;
+    parse_messages_response(&body)
+}
+
 fn decode_payload(payload_base64: &str) -> Vec<u8> {
     use base64::Engine as _;
 
@@ -87,11 +165,13 @@ struct IggyBindData {
 
 struct IggyInitData {
     http_url: String,
+    username: String,
+    password: String,
     stream_id: String,
     topic_id: String,
     partition_id: u32,
     http_client: Client,
-    auth_header: String,
+    auth_header: Mutex<String>,
     current_offset: AtomicU64,
     finished: AtomicBool,
 }
@@ -108,7 +188,11 @@ impl VTab for IggyVTab {
 
         let stream_param = bind.get_parameter(0).to_string();
         let topic_param = bind.get_parameter(1).to_string();
-        let partition_id = bind.get_parameter(2).to_string().parse::<u32>().unwrap_or(1);
+        let partition_id = bind
+            .get_parameter(2)
+            .to_string()
+            .parse::<u32>()
+            .unwrap_or(0);
         let server_address = bind.get_parameter(3).to_string();
 
         Ok(IggyBindData {
@@ -130,31 +214,23 @@ impl VTab for IggyVTab {
         let (http_url, username, password) = parse_iggy_connection_string(&connection_string)?;
 
         // Authenticate and get JWT token
-        let http_client = Client::new();
+        let http_client = Client::builder()
+            .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
+            .build()?;
         let jwt_token = RUNTIME.block_on(async {
-            let login_url = format!("{}/users/login", http_url);
-            let login_body = json!({
-                "username": username,
-                "password": password
-            });
-
-            let response = http_client.post(&login_url)
-                .header("Content-Type", "application/json")
-                .json(&login_body)
-                .send()
-                .await?;
-
-            let response_json: Value = response.json().await?;
-            extract_access_token(&response_json)
+            authenticate(&http_client, &http_url, &username, &password).await
         })?;
 
         Ok(IggyInitData {
             http_url,
+            username,
+            password,
             stream_id,
             topic_id,
             partition_id,
             http_client,
-            auth_header: format!("Bearer {}", jwt_token),
+            auth_header: Mutex::new(format!("Bearer {}", jwt_token)),
             current_offset: AtomicU64::new(0),
             finished: AtomicBool::new(false),
         })
@@ -171,26 +247,12 @@ impl VTab for IggyVTab {
             return Ok(());
         }
 
-        let json_result = RUNTIME.block_on(async {
-            let current_offset = init_data.current_offset.load(Ordering::Relaxed);
-            
-            let url = format!(
-                "{}/streams/{}/topics/{}/messages?offset={}&count=1024&partition={}",
-                init_data.http_url, init_data.stream_id, init_data.topic_id, current_offset, init_data.partition_id
-            );
-            
-            let response = init_data.http_client.get(&url)
-                .header("Authorization", &init_data.auth_header)
-                .send()
-                .await?;
+        let start_offset = init_data.current_offset.load(Ordering::Relaxed);
+        let json_result =
+            RUNTIME.block_on(async { fetch_messages(init_data, start_offset).await })?;
 
-            let body = response.bytes().await?;
-            let json = parse_messages_response(&body)?;
-
-            Ok::<Value, Box<dyn Error>>(json)
-        })?;
-
-        let messages_array = json_result.get("messages")
+        let messages_array = json_result
+            .get("messages")
             .and_then(|m| m.as_array())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
@@ -202,21 +264,25 @@ impl VTab for IggyVTab {
         }
 
         let offset_vec = output.flat_vector(0);
-        let payload_vec = output.flat_vector(1);
+        let mut payload_vec = output.flat_vector(1);
 
         let count = messages_array.len();
-        let mut last_processed_offset = 0;
-        let start_offset = init_data.current_offset.load(Ordering::Relaxed);
+        let mut expected_offset = start_offset;
+        let mut last_processed_offset = None;
 
         for (i, msg) in messages_array.iter().enumerate() {
-            let offset = msg.get("header")
+            let offset = msg
+                .get("header")
                 .and_then(|h| h.get("offset"))
                 .and_then(|v| v.as_u64())
-                .unwrap_or(0);
+                .ok_or_else(|| format!("Message at batch index {} is missing header.offset", i))?;
 
-            if i == 0 && offset < start_offset && start_offset != 0 {
-                output.set_len(0);
-                return Ok(());
+            if offset != expected_offset {
+                return Err(format!(
+                    "Expected offset {} but received {} at batch index {}",
+                    expected_offset, offset, i
+                )
+                .into());
             }
 
             unsafe {
@@ -226,15 +292,20 @@ impl VTab for IggyVTab {
 
             if let Some(payload_base64) = msg.get("payload").and_then(|v| v.as_str()) {
                 let decoded_bytes = decode_payload(payload_base64);
-                payload_vec.insert(i, &decoded_bytes);
+                payload_vec.insert(i, decoded_bytes.as_slice());
+            } else {
+                payload_vec.set_null(i);
             }
-            
-            last_processed_offset = offset;
+
+            expected_offset = offset + 1;
+            last_processed_offset = Some(offset);
         }
 
-        init_data
-            .current_offset
-            .store(last_processed_offset + 1, Ordering::Release);
+        if let Some(last_processed_offset) = last_processed_offset {
+            init_data
+                .current_offset
+                .store(last_processed_offset + 1, Ordering::Release);
+        }
 
         output.set_len(count);
         Ok(())
@@ -266,7 +337,7 @@ mod tests {
         let (http_url, username, password) =
             parse_iggy_connection_string("iggy://alice:secret@example.com:8090").unwrap();
 
-        assert_eq!(http_url, "http://example.com:3000");
+        assert_eq!(http_url, "http://example.com:8090");
         assert_eq!(username, "alice");
         assert_eq!(password, "secret");
     }
@@ -276,7 +347,7 @@ mod tests {
         let (http_url, username, password) =
             parse_iggy_connection_string("localhost:8090").unwrap();
 
-        assert_eq!(http_url, "http://localhost:3000");
+        assert_eq!(http_url, "http://localhost:8090");
         assert_eq!(username, "iggy");
         assert_eq!(password, "iggy");
     }
@@ -288,7 +359,17 @@ mod tests {
 
         assert_eq!(http_url, "http://example.com:3000");
         assert_eq!(username, "alice");
-        assert_eq!(password, "");
+        assert_eq!(password, "iggy");
+    }
+
+    #[test]
+    fn parses_connection_string_with_ipv6_host() {
+        let (http_url, username, password) =
+            parse_iggy_connection_string("iggy://alice:secret@[::1]:3001").unwrap();
+
+        assert_eq!(http_url, "http://[::1]:3001");
+        assert_eq!(username, "alice");
+        assert_eq!(password, "secret");
     }
 
     #[test]
