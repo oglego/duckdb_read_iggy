@@ -128,8 +128,24 @@ LOAD './build/debug/extension/read_iggy/read_iggy.duckdb_extension';
 SELECT 
   "offset", 
   CAST(payload AS VARCHAR) as message 
-FROM read_iggy('0', '0', 0, 'iggy://iggy:iggy@127.0.0.1:8090') 
+FROM read_iggy('0', '0', 0, 'iggy://iggy:iggy@127.0.0.1:3000') 
 LIMIT 5;
+```
+
+Example output:
+
+```text
+DuckDB v1.5.2 (Variegata)
+Enter ".help" for usage hints.
+memory D LOAD './build/debug/extension/read_iggy/read_iggy.duckdb_extension';
+memory D SELECT "offset", CAST(payload AS VARCHAR) AS message FROM read_iggy('0', '0', 0, 'iggy://iggy:iggy@127.0.0.1:3000')LIMIT 5;
+┌────────┬─────────────┐
+│ offset │   message   │
+│ int64  │   varchar   │
+├────────┼─────────────┤
+│      0 │ Hello 0.7.0 │
+└────────┴─────────────┘
+memory D
 ```
 
 Note: Use the auto-generated IDs (typically 0 for the first stream and topic created).
