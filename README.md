@@ -10,7 +10,20 @@ A high-performance DuckDB extension for reading message streams directly from [I
 - HTTP-based API (version-agnostic, no binary protocol issues)
 - JWT authentication support
 - Partition-based message consumption
+- Snapshot-style reads of a single HTTP batch
 - Full DuckDB integration
+
+## Current Limitation
+
+The extension currently performs **snapshot-style reads** only. Each `read_iggy(...)` query fetches a single batch of messages from the Iggy HTTP API and then stops.
+
+This limitation exists because, in the Iggy HTTP behavior currently being tested with v0.7.0, repeated requests with different `offset` values can still return the same batch starting at offset `0`. Since the endpoint does not reliably honor the requested offset, the extension cannot safely paginate multiple batches without risking duplicate rows or infinite replay.
+
+In practice, this means:
+- A single query returns at most one batch from Iggy
+- The extension does not currently tail the stream
+- The extension does not currently page through the full topic history
+- Running the query again performs a fresh snapshot read
 
 ---
 
@@ -181,7 +194,9 @@ GET /api/streams/{stream_id}/topics/{topic_id}/partitions/{partition_id}/message
   ?offset={current_offset}&count=1024
 ```
 
-The extension tracks offset internally, validates that returned offsets are contiguous, and only advances to the next batch after the current batch has been validated.
+The extension currently performs a single HTTP fetch per query and returns that batch as a snapshot.
+
+This is intentional for now: during testing against Iggy v0.7.0, repeated requests with increasing `offset` values still returned the same batch from offset `0`. To avoid duplicate reads and infinite replay, the extension stops after the first batch instead of attempting offset-based pagination.
 
 ---
 

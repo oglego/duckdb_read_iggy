@@ -267,8 +267,6 @@ impl VTab for IggyVTab {
         let mut payload_vec = output.flat_vector(1);
 
         let count = messages_array.len();
-        let mut expected_offset = start_offset;
-        let mut last_processed_offset = None;
 
         for (i, msg) in messages_array.iter().enumerate() {
             let offset = msg
@@ -276,14 +274,6 @@ impl VTab for IggyVTab {
                 .and_then(|h| h.get("offset"))
                 .and_then(|v| v.as_u64())
                 .ok_or_else(|| format!("Message at batch index {} is missing header.offset", i))?;
-
-            if offset != expected_offset {
-                return Err(format!(
-                    "Expected offset {} but received {} at batch index {}",
-                    expected_offset, offset, i
-                )
-                .into());
-            }
 
             unsafe {
                 let offset_ptr = offset_vec.as_mut_ptr() as *mut i64;
@@ -296,17 +286,9 @@ impl VTab for IggyVTab {
             } else {
                 payload_vec.set_null(i);
             }
-
-            expected_offset = offset + 1;
-            last_processed_offset = Some(offset);
         }
 
-        if let Some(last_processed_offset) = last_processed_offset {
-            init_data
-                .current_offset
-                .store(last_processed_offset + 1, Ordering::Release);
-        }
-
+        init_data.finished.store(true, Ordering::Release);
         output.set_len(count);
         Ok(())
     }
